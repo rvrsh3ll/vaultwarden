@@ -1,16 +1,27 @@
-use chrono::{Duration, NaiveDateTime, Utc};
+use chrono::{NaiveDateTime, TimeDelta, Utc};
+use derive_more::{AsRef, Deref, Display, From};
 use serde_json::Value;
 
-use crate::crypto;
-use crate::CONFIG;
+use super::{
+    Cipher, Device, EmergencyAccess, Favorite, Folder, Membership, MembershipType, TwoFactor, TwoFactorIncomplete,
+};
+use crate::{
+    api::EmptyResult,
+    crypto,
+    db::DbConn,
+    error::MapResult,
+    util::{format_date, get_uuid, retry},
+    CONFIG,
+};
+use macros::UuidFromParam;
 
 db_object! {
     #[derive(Identifiable, Queryable, Insertable, AsChangeset)]
-    #[table_name = "users"]
-    #[changeset_options(treat_none_as_null="true")]
-    #[primary_key(uuid)]
+    #[diesel(table_name = users)]
+    #[diesel(treat_none_as_null = true)]
+    #[diesel(primary_key(uuid))]
     pub struct User {
-        pub uuid: String,
+        pub uuid: UserId,
         pub enabled: bool,
         pub created_at: NaiveDateTime,
         pub updated_at: NaiveDateTime,
@@ -32,7 +43,7 @@ db_object! {
         pub private_key: Option<String>,
         pub public_key: Option<String>,
 
-        #[column_name = "totp_secret"] // Note, this is only added to the UserDb structs, not to User
+        #[diesel(column_name = "totp_secret")] // Note, this is only added to the UserDb structs, not to User
         _totp_secret: Option<String>,
         pub totp_recover: Option<String>,
 
@@ -44,16 +55,27 @@ db_object! {
 
         pub client_kdf_type: i32,
         pub client_kdf_iter: i32,
+        pub client_kdf_memory: Option<i32>,
+        pub client_kdf_parallelism: Option<i32>,
 
         pub api_key: Option<String>,
+
+        pub avatar_color: Option<String>,
+
+        pub external_id: Option<String>, // Todo: Needs to be removed in the future, this is not used anymore.
     }
 
     #[derive(Identifiable, Queryable, Insertable)]
-    #[table_name = "invitations"]
-    #[primary_key(email)]
+    #[diesel(table_name = invitations)]
+    #[diesel(primary_key(email))]
     pub struct Invitation {
         pub email: String,
     }
+}
+
+pub enum UserKdfType {
+    Pbkdf2 = 0,
+    Argon2id = 1,
 }
 
 enum UserStatus {
@@ -71,15 +93,15 @@ pub struct UserStampException {
 
 /// Local methods
 impl User {
-    pub const CLIENT_KDF_TYPE_DEFAULT: i32 = 0; // PBKDF2: 0
-    pub const CLIENT_KDF_ITER_DEFAULT: i32 = 100_000;
+    pub const CLIENT_KDF_TYPE_DEFAULT: i32 = UserKdfType::Pbkdf2 as i32;
+    pub const CLIENT_KDF_ITER_DEFAULT: i32 = 600_000;
 
     pub fn new(email: String) -> Self {
         let now = Utc::now().naive_utc();
         let email = email.to_lowercase();
 
         Self {
-            uuid: crate::util::get_uuid(),
+            uuid: UserId(get_uuid()),
             enabled: true,
             created_at: now,
             updated_at: now,
@@ -93,10 +115,10 @@ impl User {
             email_new_token: None,
 
             password_hash: Vec::new(),
-            salt: crypto::get_random_64(),
+            salt: crypto::get_random_bytes::<64>().to_vec(),
             password_iterations: CONFIG.password_iterations(),
 
-            security_stamp: crate::util::get_uuid(),
+            security_stamp: get_uuid(),
             stamp_exception: None,
 
             password_hint: None,
@@ -111,8 +133,14 @@ impl User {
 
             client_kdf_type: Self::CLIENT_KDF_TYPE_DEFAULT,
             client_kdf_iter: Self::CLIENT_KDF_ITER_DEFAULT,
+            client_kdf_memory: None,
+            client_kdf_parallelism: None,
 
             api_key: None,
+
+            avatar_color: None,
+
+            external_id: None, // Todo: Needs to be removed in the future, this is not used anymore.
         }
     }
 
@@ -127,14 +155,14 @@ impl User {
 
     pub fn check_valid_recovery_code(&self, recovery_code: &str) -> bool {
         if let Some(ref totp_recover) = self.totp_recover {
-            crate::crypto::ct_eq(recovery_code, totp_recover.to_lowercase())
+            crypto::ct_eq(recovery_code, totp_recover.to_lowercase())
         } else {
             false
         }
     }
 
     pub fn check_valid_api_key(&self, key: &str) -> bool {
-        matches!(self.api_key, Some(ref api_key) if crate::crypto::ct_eq(api_key, key))
+        matches!(self.api_key, Some(ref api_key) if crypto::ct_eq(api_key, key))
     }
 
     /// Set the password hash generated
@@ -143,22 +171,35 @@ impl User {
     /// # Arguments
     ///
     /// * `password` - A str which contains a hashed version of the users master password.
+    /// * `new_key` - A String  which contains the new aKey value of the users master password.
     /// * `allow_next_route` - A Option<Vec<String>> with the function names of the next allowed (rocket) routes.
     ///                       These routes are able to use the previous stamp id for the next 2 minutes.
     ///                       After these 2 minutes this stamp will expire.
     ///
-    pub fn set_password(&mut self, password: &str, allow_next_route: Option<Vec<String>>) {
+    pub fn set_password(
+        &mut self,
+        password: &str,
+        new_key: Option<String>,
+        reset_security_stamp: bool,
+        allow_next_route: Option<Vec<String>>,
+    ) {
         self.password_hash = crypto::hash_password(password.as_bytes(), &self.salt, self.password_iterations as u32);
 
         if let Some(route) = allow_next_route {
             self.set_stamp_exception(route);
         }
 
-        self.reset_security_stamp()
+        if let Some(new_key) = new_key {
+            self.akey = new_key;
+        }
+
+        if reset_security_stamp {
+            self.reset_security_stamp()
+        }
     }
 
     pub fn reset_security_stamp(&mut self) {
-        self.security_stamp = crate::util::get_uuid();
+        self.security_stamp = get_uuid();
     }
 
     /// Set the stamp_exception to only allow a subsequent request matching a specific route using the current security-stamp.
@@ -171,8 +212,8 @@ impl User {
     pub fn set_stamp_exception(&mut self, route_exception: Vec<String>) {
         let stamp_exception = UserStampException {
             routes: route_exception,
-            security_stamp: self.security_stamp.to_string(),
-            expire: (Utc::now().naive_utc() + Duration::minutes(2)).timestamp(),
+            security_stamp: self.security_stamp.clone(),
+            expire: (Utc::now() + TimeDelta::try_minutes(2).unwrap()).timestamp(),
         };
         self.stamp_exception = Some(serde_json::to_string(&stamp_exception).unwrap_or_default());
     }
@@ -183,21 +224,15 @@ impl User {
     }
 }
 
-use super::{
-    Cipher, Device, EmergencyAccess, Favorite, Folder, Send, TwoFactor, TwoFactorIncomplete, UserOrgType,
-    UserOrganization,
-};
-use crate::db::DbConn;
-
-use crate::api::EmptyResult;
-use crate::error::MapResult;
-
 /// Database methods
 impl User {
-    pub fn to_json(&self, conn: &DbConn) -> Value {
-        let orgs = UserOrganization::find_confirmed_by_user(&self.uuid, conn);
-        let orgs_json: Vec<Value> = orgs.iter().map(|c| c.to_json(conn)).collect();
-        let twofactor_enabled = !TwoFactor::find_by_user(&self.uuid, conn).is_empty();
+    pub async fn to_json(&self, conn: &mut DbConn) -> Value {
+        let mut orgs_json = Vec::new();
+        for c in Membership::find_confirmed_by_user(&self.uuid, conn).await {
+            orgs_json.push(c.to_json(conn).await);
+        }
+
+        let twofactor_enabled = !TwoFactor::find_by_user(&self.uuid, conn).await.is_empty();
 
         // TODO: Might want to save the status field in the DB
         let status = if self.password_hash.is_empty() {
@@ -207,27 +242,31 @@ impl User {
         };
 
         json!({
-            "_Status": status as i32,
-            "Id": self.uuid,
-            "Name": self.name,
-            "Email": self.email,
-            "EmailVerified": !CONFIG.mail_enabled() || self.verified_at.is_some(),
-            "Premium": true,
-            "MasterPasswordHint": self.password_hint,
-            "Culture": "en-US",
-            "TwoFactorEnabled": twofactor_enabled,
-            "Key": self.akey,
-            "PrivateKey": self.private_key,
-            "SecurityStamp": self.security_stamp,
-            "Organizations": orgs_json,
-            "Providers": [],
-            "ProviderOrganizations": [],
-            "ForcePasswordReset": false,
-            "Object": "profile",
+            "_status": status as i32,
+            "id": self.uuid,
+            "name": self.name,
+            "email": self.email,
+            "emailVerified": !CONFIG.mail_enabled() || self.verified_at.is_some(),
+            "premium": true,
+            "premiumFromOrganization": false,
+            "masterPasswordHint": self.password_hint,
+            "culture": "en-US",
+            "twoFactorEnabled": twofactor_enabled,
+            "key": self.akey,
+            "privateKey": self.private_key,
+            "securityStamp": self.security_stamp,
+            "organizations": orgs_json,
+            "providers": [],
+            "providerOrganizations": [],
+            "forcePasswordReset": false,
+            "avatarColor": self.avatar_color,
+            "usesKeyConnector": false,
+            "creationDate": format_date(&self.created_at),
+            "object": "profile",
         })
     }
 
-    pub fn save(&mut self, conn: &DbConn) -> EmptyResult {
+    pub async fn save(&mut self, conn: &mut DbConn) -> EmptyResult {
         if self.email.trim().is_empty() {
             err!("User email can't be empty")
         }
@@ -265,26 +304,26 @@ impl User {
         }
     }
 
-    pub fn delete(self, conn: &DbConn) -> EmptyResult {
-        for user_org in UserOrganization::find_confirmed_by_user(&self.uuid, conn) {
-            if user_org.atype == UserOrgType::Owner {
-                let owner_type = UserOrgType::Owner as i32;
-                if UserOrganization::find_by_org_and_type(&user_org.org_uuid, owner_type, conn).len() <= 1 {
-                    err!("Can't delete last owner")
-                }
+    pub async fn delete(self, conn: &mut DbConn) -> EmptyResult {
+        for member in Membership::find_confirmed_by_user(&self.uuid, conn).await {
+            if member.atype == MembershipType::Owner
+                && Membership::count_confirmed_by_org_and_type(&member.org_uuid, MembershipType::Owner, conn).await <= 1
+            {
+                err!("Can't delete last owner")
             }
         }
 
-        Send::delete_all_by_user(&self.uuid, conn)?;
-        EmergencyAccess::delete_all_by_user(&self.uuid, conn)?;
-        UserOrganization::delete_all_by_user(&self.uuid, conn)?;
-        Cipher::delete_all_by_user(&self.uuid, conn)?;
-        Favorite::delete_all_by_user(&self.uuid, conn)?;
-        Folder::delete_all_by_user(&self.uuid, conn)?;
-        Device::delete_all_by_user(&self.uuid, conn)?;
-        TwoFactor::delete_all_by_user(&self.uuid, conn)?;
-        TwoFactorIncomplete::delete_all_by_user(&self.uuid, conn)?;
-        Invitation::take(&self.email, conn); // Delete invitation if any
+        super::Send::delete_all_by_user(&self.uuid, conn).await?;
+        EmergencyAccess::delete_all_by_user(&self.uuid, conn).await?;
+        EmergencyAccess::delete_all_by_grantee_email(&self.email, conn).await?;
+        Membership::delete_all_by_user(&self.uuid, conn).await?;
+        Cipher::delete_all_by_user(&self.uuid, conn).await?;
+        Favorite::delete_all_by_user(&self.uuid, conn).await?;
+        Folder::delete_all_by_user(&self.uuid, conn).await?;
+        Device::delete_all_by_user(&self.uuid, conn).await?;
+        TwoFactor::delete_all_by_user(&self.uuid, conn).await?;
+        TwoFactorIncomplete::delete_all_by_user(&self.uuid, conn).await?;
+        Invitation::take(&self.email, conn).await; // Delete invitation if any
 
         db_run! {conn: {
             diesel::delete(users::table.filter(users::uuid.eq(self.uuid)))
@@ -293,17 +332,17 @@ impl User {
         }}
     }
 
-    pub fn update_uuid_revision(uuid: &str, conn: &DbConn) {
-        if let Err(e) = Self::_update_revision(uuid, &Utc::now().naive_utc(), conn) {
+    pub async fn update_uuid_revision(uuid: &UserId, conn: &mut DbConn) {
+        if let Err(e) = Self::_update_revision(uuid, &Utc::now().naive_utc(), conn).await {
             warn!("Failed to update revision for {}: {:#?}", uuid, e);
         }
     }
 
-    pub fn update_all_revisions(conn: &DbConn) -> EmptyResult {
+    pub async fn update_all_revisions(conn: &mut DbConn) -> EmptyResult {
         let updated_at = Utc::now().naive_utc();
 
         db_run! {conn: {
-            crate::util::retry(|| {
+            retry(|| {
                 diesel::update(users::table)
                     .set(users::updated_at.eq(updated_at))
                     .execute(conn)
@@ -312,15 +351,15 @@ impl User {
         }}
     }
 
-    pub fn update_revision(&mut self, conn: &DbConn) -> EmptyResult {
+    pub async fn update_revision(&mut self, conn: &mut DbConn) -> EmptyResult {
         self.updated_at = Utc::now().naive_utc();
 
-        Self::_update_revision(&self.uuid, &self.updated_at, conn)
+        Self::_update_revision(&self.uuid, &self.updated_at, conn).await
     }
 
-    fn _update_revision(uuid: &str, date: &NaiveDateTime, conn: &DbConn) -> EmptyResult {
+    async fn _update_revision(uuid: &UserId, date: &NaiveDateTime, conn: &mut DbConn) -> EmptyResult {
         db_run! {conn: {
-            crate::util::retry(|| {
+            retry(|| {
                 diesel::update(users::table.filter(users::uuid.eq(uuid)))
                     .set(users::updated_at.eq(date))
                     .execute(conn)
@@ -329,7 +368,7 @@ impl User {
         }}
     }
 
-    pub fn find_by_mail(mail: &str, conn: &DbConn) -> Option<Self> {
+    pub async fn find_by_mail(mail: &str, conn: &mut DbConn) -> Option<Self> {
         let lower_mail = mail.to_lowercase();
         db_run! {conn: {
             users::table
@@ -340,20 +379,20 @@ impl User {
         }}
     }
 
-    pub fn find_by_uuid(uuid: &str, conn: &DbConn) -> Option<Self> {
+    pub async fn find_by_uuid(uuid: &UserId, conn: &mut DbConn) -> Option<Self> {
         db_run! {conn: {
             users::table.filter(users::uuid.eq(uuid)).first::<UserDb>(conn).ok().from_db()
         }}
     }
 
-    pub fn get_all(conn: &DbConn) -> Vec<Self> {
+    pub async fn get_all(conn: &mut DbConn) -> Vec<Self> {
         db_run! {conn: {
             users::table.load::<UserDb>(conn).expect("Error loading users").from_db()
         }}
     }
 
-    pub fn last_active(&self, conn: &DbConn) -> Option<NaiveDateTime> {
-        match Device::find_latest_active_by_user(&self.uuid, conn) {
+    pub async fn last_active(&self, conn: &mut DbConn) -> Option<NaiveDateTime> {
+        match Device::find_latest_active_by_user(&self.uuid, conn).await {
             Some(device) => Some(device.updated_at),
             None => None,
         }
@@ -361,14 +400,14 @@ impl User {
 }
 
 impl Invitation {
-    pub fn new(email: String) -> Self {
+    pub fn new(email: &str) -> Self {
         let email = email.to_lowercase();
         Self {
             email,
         }
     }
 
-    pub fn save(&self, conn: &DbConn) -> EmptyResult {
+    pub async fn save(&self, conn: &mut DbConn) -> EmptyResult {
         if self.email.trim().is_empty() {
             err!("Invitation email can't be empty")
         }
@@ -393,7 +432,7 @@ impl Invitation {
         }
     }
 
-    pub fn delete(self, conn: &DbConn) -> EmptyResult {
+    pub async fn delete(self, conn: &mut DbConn) -> EmptyResult {
         db_run! {conn: {
             diesel::delete(invitations::table.filter(invitations::email.eq(self.email)))
                 .execute(conn)
@@ -401,7 +440,7 @@ impl Invitation {
         }}
     }
 
-    pub fn find_by_mail(mail: &str, conn: &DbConn) -> Option<Self> {
+    pub async fn find_by_mail(mail: &str, conn: &mut DbConn) -> Option<Self> {
         let lower_mail = mail.to_lowercase();
         db_run! {conn: {
             invitations::table
@@ -412,10 +451,30 @@ impl Invitation {
         }}
     }
 
-    pub fn take(mail: &str, conn: &DbConn) -> bool {
-        match Self::find_by_mail(mail, conn) {
-            Some(invitation) => invitation.delete(conn).is_ok(),
+    pub async fn take(mail: &str, conn: &mut DbConn) -> bool {
+        match Self::find_by_mail(mail, conn).await {
+            Some(invitation) => invitation.delete(conn).await.is_ok(),
             None => false,
         }
     }
 }
+
+#[derive(
+    Clone,
+    Debug,
+    DieselNewType,
+    FromForm,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    AsRef,
+    Deref,
+    Display,
+    From,
+    UuidFromParam,
+)]
+#[deref(forward)]
+#[from(forward)]
+pub struct UserId(String);

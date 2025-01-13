@@ -1,28 +1,36 @@
 use std::io::ErrorKind;
 
+use bigdecimal::{BigDecimal, ToPrimitive};
+use derive_more::{AsRef, Deref, Display};
 use serde_json::Value;
 
-use super::Cipher;
+use super::{CipherId, OrganizationId, UserId};
 use crate::CONFIG;
+use macros::IdFromParam;
 
 db_object! {
-    #[derive(Identifiable, Queryable, Insertable, Associations, AsChangeset)]
-    #[table_name = "attachments"]
-    #[changeset_options(treat_none_as_null="true")]
-    #[belongs_to(super::Cipher, foreign_key = "cipher_uuid")]
-    #[primary_key(id)]
+    #[derive(Identifiable, Queryable, Insertable, AsChangeset)]
+    #[diesel(table_name = attachments)]
+    #[diesel(treat_none_as_null = true)]
+    #[diesel(primary_key(id))]
     pub struct Attachment {
-        pub id: String,
-        pub cipher_uuid: String,
+        pub id: AttachmentId,
+        pub cipher_uuid: CipherId,
         pub file_name: String, // encrypted
-        pub file_size: i32,
+        pub file_size: i64,
         pub akey: Option<String>,
     }
 }
 
 /// Local methods
 impl Attachment {
-    pub const fn new(id: String, cipher_uuid: String, file_name: String, file_size: i32, akey: Option<String>) -> Self {
+    pub const fn new(
+        id: AttachmentId,
+        cipher_uuid: CipherId,
+        file_name: String,
+        file_size: i64,
+        akey: Option<String>,
+    ) -> Self {
         Self {
             id,
             cipher_uuid,
@@ -37,22 +45,24 @@ impl Attachment {
     }
 
     pub fn get_url(&self, host: &str) -> String {
-        format!("{}/attachments/{}/{}", host, self.cipher_uuid, self.id)
+        let token = encode_jwt(&generate_file_download_claims(self.cipher_uuid.clone(), self.id.clone()));
+        format!("{}/attachments/{}/{}?token={}", host, self.cipher_uuid, self.id, token)
     }
 
     pub fn to_json(&self, host: &str) -> Value {
         json!({
-            "Id": self.id,
-            "Url": self.get_url(host),
-            "FileName": self.file_name,
-            "Size": self.file_size.to_string(),
-            "SizeName": crate::util::get_display_size(self.file_size),
-            "Key": self.akey,
-            "Object": "attachment"
+            "id": self.id,
+            "url": self.get_url(host),
+            "fileName": self.file_name,
+            "size": self.file_size.to_string(),
+            "sizeName": crate::util::get_display_size(self.file_size),
+            "key": self.akey,
+            "object": "attachment"
         })
     }
 }
 
+use crate::auth::{encode_jwt, generate_file_download_claims};
 use crate::db::DbConn;
 
 use crate::api::EmptyResult;
@@ -60,7 +70,7 @@ use crate::error::MapResult;
 
 /// Database methods
 impl Attachment {
-    pub fn save(&self, conn: &DbConn) -> EmptyResult {
+    pub async fn save(&self, conn: &mut DbConn) -> EmptyResult {
         db_run! { conn:
             sqlite, mysql {
                 match diesel::replace_into(attachments::table)
@@ -92,9 +102,9 @@ impl Attachment {
         }
     }
 
-    pub fn delete(&self, conn: &DbConn) -> EmptyResult {
+    pub async fn delete(&self, conn: &mut DbConn) -> EmptyResult {
         db_run! { conn: {
-            crate::util::retry(
+            let _: () = crate::util::retry(
                 || diesel::delete(attachments::table.filter(attachments::id.eq(&self.id))).execute(conn),
                 10,
             )
@@ -102,7 +112,7 @@ impl Attachment {
 
             let file_path = &self.get_file_path();
 
-            match crate::util::delete_file(file_path) {
+            match std::fs::remove_file(file_path) {
                 // Ignore "file not found" errors. This can happen when the
                 // upstream caller has already cleaned up the file as part of
                 // its own error handling.
@@ -116,14 +126,14 @@ impl Attachment {
         }}
     }
 
-    pub fn delete_all_by_cipher(cipher_uuid: &str, conn: &DbConn) -> EmptyResult {
-        for attachment in Attachment::find_by_cipher(cipher_uuid, conn) {
-            attachment.delete(conn)?;
+    pub async fn delete_all_by_cipher(cipher_uuid: &CipherId, conn: &mut DbConn) -> EmptyResult {
+        for attachment in Attachment::find_by_cipher(cipher_uuid, conn).await {
+            attachment.delete(conn).await?;
         }
         Ok(())
     }
 
-    pub fn find_by_id(id: &str, conn: &DbConn) -> Option<Self> {
+    pub async fn find_by_id(id: &AttachmentId, conn: &mut DbConn) -> Option<Self> {
         db_run! { conn: {
             attachments::table
                 .filter(attachments::id.eq(id.to_lowercase()))
@@ -133,7 +143,7 @@ impl Attachment {
         }}
     }
 
-    pub fn find_by_cipher(cipher_uuid: &str, conn: &DbConn) -> Vec<Self> {
+    pub async fn find_by_cipher(cipher_uuid: &CipherId, conn: &mut DbConn) -> Vec<Self> {
         db_run! { conn: {
             attachments::table
                 .filter(attachments::cipher_uuid.eq(cipher_uuid))
@@ -143,19 +153,24 @@ impl Attachment {
         }}
     }
 
-    pub fn size_by_user(user_uuid: &str, conn: &DbConn) -> i64 {
+    pub async fn size_by_user(user_uuid: &UserId, conn: &mut DbConn) -> i64 {
         db_run! { conn: {
-            let result: Option<i64> = attachments::table
+            let result: Option<BigDecimal> = attachments::table
                 .left_join(ciphers::table.on(ciphers::uuid.eq(attachments::cipher_uuid)))
                 .filter(ciphers::user_uuid.eq(user_uuid))
                 .select(diesel::dsl::sum(attachments::file_size))
                 .first(conn)
                 .expect("Error loading user attachment total size");
-            result.unwrap_or(0)
+
+            match result.map(|r| r.to_i64()) {
+                Some(Some(r)) => r,
+                Some(None) => i64::MAX,
+                None => 0
+            }
         }}
     }
 
-    pub fn count_by_user(user_uuid: &str, conn: &DbConn) -> i64 {
+    pub async fn count_by_user(user_uuid: &UserId, conn: &mut DbConn) -> i64 {
         db_run! { conn: {
             attachments::table
                 .left_join(ciphers::table.on(ciphers::uuid.eq(attachments::cipher_uuid)))
@@ -166,19 +181,24 @@ impl Attachment {
         }}
     }
 
-    pub fn size_by_org(org_uuid: &str, conn: &DbConn) -> i64 {
+    pub async fn size_by_org(org_uuid: &OrganizationId, conn: &mut DbConn) -> i64 {
         db_run! { conn: {
-            let result: Option<i64> = attachments::table
+            let result: Option<BigDecimal> = attachments::table
                 .left_join(ciphers::table.on(ciphers::uuid.eq(attachments::cipher_uuid)))
                 .filter(ciphers::organization_uuid.eq(org_uuid))
                 .select(diesel::dsl::sum(attachments::file_size))
                 .first(conn)
                 .expect("Error loading user attachment total size");
-            result.unwrap_or(0)
+
+            match result.map(|r| r.to_i64()) {
+                Some(Some(r)) => r,
+                Some(None) => i64::MAX,
+                None => 0
+            }
         }}
     }
 
-    pub fn count_by_org(org_uuid: &str, conn: &DbConn) -> i64 {
+    pub async fn count_by_org(org_uuid: &OrganizationId, conn: &mut DbConn) -> i64 {
         db_run! { conn: {
             attachments::table
                 .left_join(ciphers::table.on(ciphers::uuid.eq(attachments::cipher_uuid)))
@@ -186,6 +206,43 @@ impl Attachment {
                 .count()
                 .first(conn)
                 .unwrap_or(0)
+        }}
+    }
+
+    // This will return all attachments linked to the user or org
+    // There is no filtering done here if the user actually has access!
+    // It is used to speed up the sync process, and the matching is done in a different part.
+    pub async fn find_all_by_user_and_orgs(
+        user_uuid: &UserId,
+        org_uuids: &Vec<OrganizationId>,
+        conn: &mut DbConn,
+    ) -> Vec<Self> {
+        db_run! { conn: {
+            attachments::table
+                .left_join(ciphers::table.on(ciphers::uuid.eq(attachments::cipher_uuid)))
+                .filter(ciphers::user_uuid.eq(user_uuid))
+                .or_filter(ciphers::organization_uuid.eq_any(org_uuids))
+                .select(attachments::all_columns)
+                .load::<AttachmentDb>(conn)
+                .expect("Error loading attachments")
+                .from_db()
         }}
     }
 }
+
+#[derive(
+    Clone,
+    Debug,
+    AsRef,
+    Deref,
+    DieselNewType,
+    Display,
+    FromForm,
+    Hash,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    IdFromParam,
+)]
+pub struct AttachmentId(pub String);

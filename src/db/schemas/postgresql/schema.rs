@@ -3,7 +3,7 @@ table! {
         id -> Text,
         cipher_uuid -> Text,
         file_name -> Text,
-        file_size -> Integer,
+        file_size -> BigInt,
         akey -> Nullable<Text>,
     }
 }
@@ -15,6 +15,7 @@ table! {
         updated_at -> Timestamp,
         user_uuid -> Nullable<Text>,
         organization_uuid -> Nullable<Text>,
+        key -> Nullable<Text>,
         atype -> Integer,
         name -> Text,
         notes -> Nullable<Text>,
@@ -38,20 +39,43 @@ table! {
         uuid -> Text,
         org_uuid -> Text,
         name -> Text,
+        external_id -> Nullable<Text>,
     }
 }
 
 table! {
-    devices (uuid) {
+    devices (uuid, user_uuid) {
         uuid -> Text,
         created_at -> Timestamp,
         updated_at -> Timestamp,
         user_uuid -> Text,
         name -> Text,
         atype -> Integer,
+        push_uuid -> Nullable<Text>,
         push_token -> Nullable<Text>,
         refresh_token -> Text,
         twofactor_remember -> Nullable<Text>,
+    }
+}
+
+table! {
+    event (uuid) {
+        uuid -> Text,
+        event_type -> Integer,
+        user_uuid -> Nullable<Text>,
+        org_uuid -> Nullable<Text>,
+        cipher_uuid -> Nullable<Text>,
+        collection_uuid -> Nullable<Text>,
+        group_uuid -> Nullable<Text>,
+        org_user_uuid -> Nullable<Text>,
+        act_user_uuid -> Nullable<Text>,
+        device_type -> Nullable<Integer>,
+        ip_address -> Nullable<Text>,
+        event_date -> Timestamp,
+        policy_uuid -> Nullable<Text>,
+        provider_uuid -> Nullable<Text>,
+        provider_user_uuid -> Nullable<Text>,
+        provider_org_uuid -> Nullable<Text>,
     }
 }
 
@@ -136,7 +160,7 @@ table! {
         atype -> Integer,
         enabled -> Bool,
         data -> Text,
-        last_used -> Integer,
+        last_used -> BigInt,
     }
 }
 
@@ -145,8 +169,18 @@ table! {
         user_uuid -> Text,
         device_uuid -> Text,
         device_name -> Text,
+        device_type -> Integer,
         login_time -> Timestamp,
         ip_address -> Text,
+    }
+}
+
+table! {
+    twofactor_duo_ctx (state) {
+        state -> Text,
+        user_email -> Text,
+        nonce -> Text,
+        exp -> BigInt,
     }
 }
 
@@ -178,7 +212,11 @@ table! {
         excluded_globals -> Text,
         client_kdf_type -> Integer,
         client_kdf_iter -> Integer,
+        client_kdf_memory -> Nullable<Integer>,
+        client_kdf_parallelism -> Nullable<Integer>,
         api_key -> Nullable<Text>,
+        avatar_color -> Nullable<Text>,
+        external_id -> Nullable<Text>,
     }
 }
 
@@ -200,6 +238,18 @@ table! {
         akey -> Text,
         status -> Integer,
         atype -> Integer,
+        reset_password_key -> Nullable<Text>,
+        external_id -> Nullable<Text>,
+    }
+}
+
+table! {
+    organization_api_key (uuid, org_uuid) {
+        uuid -> Text,
+        org_uuid -> Text,
+        atype -> Integer,
+        api_key -> Text,
+        revision_date -> Timestamp,
     }
 }
 
@@ -217,6 +267,54 @@ table! {
         last_notification_at -> Nullable<Timestamp>,
         updated_at -> Timestamp,
         created_at -> Timestamp,
+    }
+}
+
+table! {
+    groups (uuid) {
+        uuid -> Text,
+        organizations_uuid -> Text,
+        name -> Text,
+        access_all -> Bool,
+        external_id -> Nullable<Text>,
+        creation_date -> Timestamp,
+        revision_date -> Timestamp,
+    }
+}
+
+table! {
+    groups_users (groups_uuid, users_organizations_uuid) {
+        groups_uuid -> Text,
+        users_organizations_uuid -> Text,
+    }
+}
+
+table! {
+    collections_groups (collections_uuid, groups_uuid) {
+        collections_uuid -> Text,
+        groups_uuid -> Text,
+        read_only -> Bool,
+        hide_passwords -> Bool,
+    }
+}
+
+table! {
+    auth_requests  (uuid) {
+        uuid -> Text,
+        user_uuid -> Text,
+        organization_uuid -> Nullable<Text>,
+        request_device_identifier -> Text,
+        device_type -> Integer,
+        request_ip -> Text,
+        response_device_id -> Nullable<Text>,
+        access_code -> Text,
+        public_key -> Text,
+        enc_key -> Nullable<Text>,
+        master_password_hash -> Nullable<Text>,
+        approved -> Nullable<Bool>,
+        creation_date -> Timestamp,
+        response_date -> Nullable<Timestamp>,
+        authentication_date -> Nullable<Timestamp>,
     }
 }
 
@@ -238,7 +336,16 @@ joinable!(users_collections -> collections (collection_uuid));
 joinable!(users_collections -> users (user_uuid));
 joinable!(users_organizations -> organizations (org_uuid));
 joinable!(users_organizations -> users (user_uuid));
+joinable!(users_organizations -> ciphers (org_uuid));
+joinable!(organization_api_key -> organizations (org_uuid));
 joinable!(emergency_access -> users (grantor_uuid));
+joinable!(groups -> organizations (organizations_uuid));
+joinable!(groups_users -> users_organizations (users_organizations_uuid));
+joinable!(groups_users -> groups (groups_uuid));
+joinable!(collections_groups -> collections (collections_uuid));
+joinable!(collections_groups -> groups (groups_uuid));
+joinable!(event -> users_organizations (uuid));
+joinable!(auth_requests -> users (user_uuid));
 
 allow_tables_to_appear_in_same_query!(
     attachments,
@@ -256,5 +363,11 @@ allow_tables_to_appear_in_same_query!(
     users,
     users_collections,
     users_organizations,
+    organization_api_key,
     emergency_access,
+    groups,
+    groups_users,
+    collections_groups,
+    event,
+    auth_requests,
 );

@@ -1,16 +1,24 @@
-#!/bin/sh
+#!/usr/bin/env sh
 
 # Use the value of the corresponding env var (if present),
 # or a default value otherwise.
-: ${DATA_FOLDER:="data"}
-: ${ROCKET_PORT:="80"}
+: "${DATA_FOLDER:="/data"}"
+: "${ROCKET_PORT:="80"}"
+: "${ENV_FILE:="/.env"}"
 
 CONFIG_FILE="${DATA_FOLDER}"/config.json
+
+# Check if the $ENV_FILE file exist and is readable
+# If that is the case, load it into the environment before running any check
+if [ -r "${ENV_FILE}" ]; then
+    # shellcheck disable=SC1090
+    . "${ENV_FILE}"
+fi
 
 # Given a config key, return the corresponding config value from the
 # config file. If the key doesn't exist, return an empty string.
 get_config_val() {
-    local key="$1"
+    key="$1"
     # Extract a line of the form:
     #   "domain": "https://bw.example.com/path",
     grep "\"${key}\":" "${CONFIG_FILE}" |
@@ -45,9 +53,13 @@ if [ -r "${CONFIG_FILE}" ]; then
     fi
 fi
 
+addr="${ROCKET_ADDRESS}"
+if [ -z "${addr}" ] || [ "${addr}" = '0.0.0.0' ] || [ "${addr}" = '::' ]; then
+    addr='localhost'
+fi
 base_path="$(get_base_path "${DOMAIN}")"
 if [ -n "${ROCKET_TLS}" ]; then
     s='s'
 fi
 curl --insecure --fail --silent --show-error \
-     "http${s}://localhost:${ROCKET_PORT}${base_path}/alive" || exit 1
+     "http${s}://${addr}:${ROCKET_PORT}${base_path}/alive" || exit 1

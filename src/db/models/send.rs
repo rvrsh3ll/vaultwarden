@@ -1,21 +1,21 @@
 use chrono::{NaiveDateTime, Utc};
 use serde_json::Value;
 
-use super::{Organization, User};
+use crate::util::LowerCase;
+
+use super::{OrganizationId, User, UserId};
+use id::SendId;
 
 db_object! {
-    #[derive(Identifiable, Queryable, Insertable, Associations, AsChangeset)]
-    #[table_name = "sends"]
-    #[changeset_options(treat_none_as_null="true")]
-    #[belongs_to(User, foreign_key = "user_uuid")]
-    #[belongs_to(Organization, foreign_key = "organization_uuid")]
-    #[primary_key(uuid)]
+    #[derive(Identifiable, Queryable, Insertable, AsChangeset)]
+    #[diesel(table_name = sends)]
+    #[diesel(treat_none_as_null = true)]
+    #[diesel(primary_key(uuid))]
     pub struct Send {
-        pub uuid: String,
+        pub uuid: SendId,
 
-        pub user_uuid: Option<String>,
-        pub organization_uuid: Option<String>,
-
+        pub user_uuid: Option<UserId>,
+        pub organization_uuid: Option<OrganizationId>,
 
         pub name: String,
         pub notes: Option<String>,
@@ -51,7 +51,7 @@ impl Send {
         let now = Utc::now().naive_utc();
 
         Self {
-            uuid: crate::util::get_uuid(),
+            uuid: SendId::from(crate::util::get_uuid()),
             user_uuid: None,
             organization_uuid: None,
 
@@ -83,7 +83,7 @@ impl Send {
 
         if let Some(password) = password {
             self.password_iter = Some(PASSWORD_ITER);
-            let salt = crate::crypto::get_random_64();
+            let salt = crate::crypto::get_random_bytes::<64>().to_vec();
             let hash = crate::crypto::hash_password(password.as_bytes(), &salt, PASSWORD_ITER as u32);
             self.password_salt = Some(salt);
             self.password_hash = Some(hash);
@@ -103,7 +103,7 @@ impl Send {
         }
     }
 
-    pub fn creator_identifier(&self, conn: &DbConn) -> Option<String> {
+    pub async fn creator_identifier(&self, conn: &mut DbConn) -> Option<String> {
         if let Some(hide_email) = self.hide_email {
             if hide_email {
                 return None;
@@ -111,7 +111,7 @@ impl Send {
         }
 
         if let Some(user_uuid) = &self.user_uuid {
-            if let Some(user) = User::find_by_uuid(user_uuid, conn) {
+            if let Some(user) = User::find_by_uuid(user_uuid, conn).await {
                 return Some(user.email);
             }
         }
@@ -124,48 +124,58 @@ impl Send {
         use data_encoding::BASE64URL_NOPAD;
         use uuid::Uuid;
 
-        let data: Value = serde_json::from_str(&self.data).unwrap_or_default();
+        let mut data = serde_json::from_str::<LowerCase<Value>>(&self.data).map(|d| d.data).unwrap_or_default();
+
+        // Mobile clients expect size to be a string instead of a number
+        if let Some(size) = data.get("size").and_then(|v| v.as_i64()) {
+            data["size"] = Value::String(size.to_string());
+        }
 
         json!({
-            "Id": self.uuid,
-            "AccessId": BASE64URL_NOPAD.encode(Uuid::parse_str(&self.uuid).unwrap_or_default().as_bytes()),
-            "Type": self.atype,
+            "id": self.uuid,
+            "accessId": BASE64URL_NOPAD.encode(Uuid::parse_str(&self.uuid).unwrap_or_default().as_bytes()),
+            "type": self.atype,
 
-            "Name": self.name,
-            "Notes": self.notes,
-            "Text": if self.atype == SendType::Text as i32 { Some(&data) } else { None },
-            "File": if self.atype == SendType::File as i32 { Some(&data) } else { None },
+            "name": self.name,
+            "notes": self.notes,
+            "text": if self.atype == SendType::Text as i32 { Some(&data) } else { None },
+            "file": if self.atype == SendType::File as i32 { Some(&data) } else { None },
 
-            "Key": self.akey,
-            "MaxAccessCount": self.max_access_count,
-            "AccessCount": self.access_count,
-            "Password": self.password_hash.as_deref().map(|h| BASE64URL_NOPAD.encode(h)),
-            "Disabled": self.disabled,
-            "HideEmail": self.hide_email,
+            "key": self.akey,
+            "maxAccessCount": self.max_access_count,
+            "accessCount": self.access_count,
+            "password": self.password_hash.as_deref().map(|h| BASE64URL_NOPAD.encode(h)),
+            "disabled": self.disabled,
+            "hideEmail": self.hide_email,
 
-            "RevisionDate": format_date(&self.revision_date),
-            "ExpirationDate": self.expiration_date.as_ref().map(format_date),
-            "DeletionDate": format_date(&self.deletion_date),
-            "Object": "send",
+            "revisionDate": format_date(&self.revision_date),
+            "expirationDate": self.expiration_date.as_ref().map(format_date),
+            "deletionDate": format_date(&self.deletion_date),
+            "object": "send",
         })
     }
 
-    pub fn to_json_access(&self, conn: &DbConn) -> Value {
+    pub async fn to_json_access(&self, conn: &mut DbConn) -> Value {
         use crate::util::format_date;
 
-        let data: Value = serde_json::from_str(&self.data).unwrap_or_default();
+        let mut data = serde_json::from_str::<LowerCase<Value>>(&self.data).map(|d| d.data).unwrap_or_default();
+
+        // Mobile clients expect size to be a string instead of a number
+        if let Some(size) = data.get("size").and_then(|v| v.as_i64()) {
+            data["size"] = Value::String(size.to_string());
+        }
 
         json!({
-            "Id": self.uuid,
-            "Type": self.atype,
+            "id": self.uuid,
+            "type": self.atype,
 
-            "Name": self.name,
-            "Text": if self.atype == SendType::Text as i32 { Some(&data) } else { None },
-            "File": if self.atype == SendType::File as i32 { Some(&data) } else { None },
+            "name": self.name,
+            "text": if self.atype == SendType::Text as i32 { Some(&data) } else { None },
+            "file": if self.atype == SendType::File as i32 { Some(&data) } else { None },
 
-            "ExpirationDate": self.expiration_date.as_ref().map(format_date),
-            "CreatorIdentifier": self.creator_identifier(conn),
-            "Object": "send-access",
+            "expirationDate": self.expiration_date.as_ref().map(format_date),
+            "creatorIdentifier": self.creator_identifier(conn).await,
+            "object": "send-access",
         })
     }
 }
@@ -174,10 +184,11 @@ use crate::db::DbConn;
 
 use crate::api::EmptyResult;
 use crate::error::MapResult;
+use crate::util::NumberOrString;
 
 impl Send {
-    pub fn save(&mut self, conn: &DbConn) -> EmptyResult {
-        self.update_users_revision(conn);
+    pub async fn save(&mut self, conn: &mut DbConn) -> EmptyResult {
+        self.update_users_revision(conn).await;
         self.revision_date = Utc::now().naive_utc();
 
         db_run! { conn:
@@ -211,8 +222,8 @@ impl Send {
         }
     }
 
-    pub fn delete(&self, conn: &DbConn) -> EmptyResult {
-        self.update_users_revision(conn);
+    pub async fn delete(&self, conn: &mut DbConn) -> EmptyResult {
+        self.update_users_revision(conn).await;
 
         if self.atype == SendType::File as i32 {
             std::fs::remove_dir_all(std::path::Path::new(&crate::CONFIG.sends_folder()).join(&self.uuid)).ok();
@@ -226,17 +237,17 @@ impl Send {
     }
 
     /// Purge all sends that are past their deletion date.
-    pub fn purge(conn: &DbConn) {
-        for send in Self::find_by_past_deletion_date(conn) {
-            send.delete(conn).ok();
+    pub async fn purge(conn: &mut DbConn) {
+        for send in Self::find_by_past_deletion_date(conn).await {
+            send.delete(conn).await.ok();
         }
     }
 
-    pub fn update_users_revision(&self, conn: &DbConn) -> Vec<String> {
+    pub async fn update_users_revision(&self, conn: &mut DbConn) -> Vec<UserId> {
         let mut user_uuids = Vec::new();
         match &self.user_uuid {
             Some(user_uuid) => {
-                User::update_uuid_revision(user_uuid, conn);
+                User::update_uuid_revision(user_uuid, conn).await;
                 user_uuids.push(user_uuid.clone())
             }
             None => {
@@ -246,31 +257,30 @@ impl Send {
         user_uuids
     }
 
-    pub fn delete_all_by_user(user_uuid: &str, conn: &DbConn) -> EmptyResult {
-        for send in Self::find_by_user(user_uuid, conn) {
-            send.delete(conn)?;
+    pub async fn delete_all_by_user(user_uuid: &UserId, conn: &mut DbConn) -> EmptyResult {
+        for send in Self::find_by_user(user_uuid, conn).await {
+            send.delete(conn).await?;
         }
         Ok(())
     }
 
-    pub fn find_by_access_id(access_id: &str, conn: &DbConn) -> Option<Self> {
+    pub async fn find_by_access_id(access_id: &str, conn: &mut DbConn) -> Option<Self> {
         use data_encoding::BASE64URL_NOPAD;
         use uuid::Uuid;
 
-        let uuid_vec = match BASE64URL_NOPAD.decode(access_id.as_bytes()) {
-            Ok(v) => v,
-            Err(_) => return None,
+        let Ok(uuid_vec) = BASE64URL_NOPAD.decode(access_id.as_bytes()) else {
+            return None;
         };
 
         let uuid = match Uuid::from_slice(&uuid_vec) {
-            Ok(u) => u.to_string(),
+            Ok(u) => SendId::from(u.to_string()),
             Err(_) => return None,
         };
 
-        Self::find_by_uuid(&uuid, conn)
+        Self::find_by_uuid(&uuid, conn).await
     }
 
-    pub fn find_by_uuid(uuid: &str, conn: &DbConn) -> Option<Self> {
+    pub async fn find_by_uuid(uuid: &SendId, conn: &mut DbConn) -> Option<Self> {
         db_run! {conn: {
             sends::table
                 .filter(sends::uuid.eq(uuid))
@@ -280,7 +290,18 @@ impl Send {
         }}
     }
 
-    pub fn find_by_user(user_uuid: &str, conn: &DbConn) -> Vec<Self> {
+    pub async fn find_by_uuid_and_user(uuid: &SendId, user_uuid: &UserId, conn: &mut DbConn) -> Option<Self> {
+        db_run! {conn: {
+            sends::table
+                .filter(sends::uuid.eq(uuid))
+                .filter(sends::user_uuid.eq(user_uuid))
+                .first::<SendDb>(conn)
+                .ok()
+                .from_db()
+        }}
+    }
+
+    pub async fn find_by_user(user_uuid: &UserId, conn: &mut DbConn) -> Vec<Self> {
         db_run! {conn: {
             sends::table
                 .filter(sends::user_uuid.eq(user_uuid))
@@ -288,7 +309,30 @@ impl Send {
         }}
     }
 
-    pub fn find_by_org(org_uuid: &str, conn: &DbConn) -> Vec<Self> {
+    pub async fn size_by_user(user_uuid: &UserId, conn: &mut DbConn) -> Option<i64> {
+        let sends = Self::find_by_user(user_uuid, conn).await;
+
+        #[derive(serde::Deserialize)]
+        struct FileData {
+            #[serde(rename = "size", alias = "Size")]
+            size: NumberOrString,
+        }
+
+        let mut total: i64 = 0;
+        for send in sends {
+            if send.atype == SendType::File as i32 {
+                if let Ok(size) =
+                    serde_json::from_str::<FileData>(&send.data).map_err(Into::into).and_then(|d| d.size.into_i64())
+                {
+                    total = total.checked_add(size)?;
+                };
+            }
+        }
+
+        Some(total)
+    }
+
+    pub async fn find_by_org(org_uuid: &OrganizationId, conn: &mut DbConn) -> Vec<Self> {
         db_run! {conn: {
             sends::table
                 .filter(sends::organization_uuid.eq(org_uuid))
@@ -296,12 +340,57 @@ impl Send {
         }}
     }
 
-    pub fn find_by_past_deletion_date(conn: &DbConn) -> Vec<Self> {
+    pub async fn find_by_past_deletion_date(conn: &mut DbConn) -> Vec<Self> {
         let now = Utc::now().naive_utc();
         db_run! {conn: {
             sends::table
                 .filter(sends::deletion_date.lt(now))
                 .load::<SendDb>(conn).expect("Error loading sends").from_db()
         }}
+    }
+}
+
+// separate namespace to avoid name collision with std::marker::Send
+pub mod id {
+    use derive_more::{AsRef, Deref, Display, From};
+    use macros::{IdFromParam, UuidFromParam};
+    use std::marker::Send;
+    use std::path::Path;
+
+    #[derive(
+        Clone,
+        Debug,
+        AsRef,
+        Deref,
+        DieselNewType,
+        Display,
+        From,
+        FromForm,
+        Hash,
+        PartialEq,
+        Eq,
+        Serialize,
+        Deserialize,
+        UuidFromParam,
+    )]
+    pub struct SendId(String);
+
+    impl AsRef<Path> for SendId {
+        #[inline]
+        fn as_ref(&self) -> &Path {
+            Path::new(&self.0)
+        }
+    }
+
+    #[derive(
+        Clone, Debug, AsRef, Deref, Display, From, FromForm, Hash, PartialEq, Eq, Serialize, Deserialize, IdFromParam,
+    )]
+    pub struct SendFileId(String);
+
+    impl AsRef<Path> for SendFileId {
+        #[inline]
+        fn as_ref(&self) -> &Path {
+            Path::new(&self.0)
+        }
     }
 }

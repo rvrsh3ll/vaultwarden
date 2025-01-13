@@ -1,154 +1,280 @@
+workspace = { members = ["macros"] }
+
 [package]
 name = "vaultwarden"
 version = "1.0.0"
 authors = ["Daniel García <dani-garcia@users.noreply.github.com>"]
 edition = "2021"
-rust-version = "1.60"
+rust-version = "1.83.0"
 resolver = "2"
 
 repository = "https://github.com/dani-garcia/vaultwarden"
 readme = "README.md"
-license = "GPL-3.0-only"
+license = "AGPL-3.0-only"
 publish = false
 build = "build.rs"
 
 [features]
+# default = ["sqlite"]
 # Empty to keep compatibility, prefer to set USE_SYSLOG=true
 enable_syslog = []
 mysql = ["diesel/mysql", "diesel_migrations/mysql"]
 postgresql = ["diesel/postgres", "diesel_migrations/postgres"]
-sqlite = ["diesel/sqlite", "diesel_migrations/sqlite", "libsqlite3-sys"]
+sqlite = ["diesel/sqlite", "diesel_migrations/sqlite", "dep:libsqlite3-sys"]
 # Enable to use a vendored and statically linked openssl
 vendored_openssl = ["openssl/vendored"]
+# Enable MiMalloc memory allocator to replace the default malloc
+# This can improve performance for Alpine builds
+enable_mimalloc = ["dep:mimalloc"]
+# This is a development dependency, and should only be used during development!
+# It enables the usage of the diesel_logger crate, which is able to output the generated queries.
+# You also need to set an env variable `QUERY_LOGGER=1` to fully activate this so you do not have to re-compile
+# if you want to turn off the logging for a specific run.
+query_logger = ["dep:diesel_logger"]
 
 # Enable unstable features, requires nightly
 # Currently only used to enable rusts official ip support
 unstable = []
 
-[target."cfg(not(windows))".dependencies]
-syslog = "4.0.1"
+[target."cfg(unix)".dependencies]
+# Logging
+syslog = "7.0.0"
 
 [dependencies]
-# Web framework for nightly with a focus on ease-of-use, expressibility, and speed.
-rocket = { version = "=0.5.0-dev", features = ["tls"], default-features = false }
-rocket_contrib = "=0.5.0-dev"
-
-# HTTP client
-reqwest = { version = "0.11.9", features = ["blocking", "json", "gzip", "brotli", "socks", "cookies", "trust-dns"] }
-
-# Used for custom short lived cookie jar
-cookie = "0.15.1"
-cookie_store = "0.15.1"
-bytes = "1.1.0"
-url = "2.2.2"
-
-# multipart/form-data support
-multipart = { version = "0.18.0", features = ["server"], default-features = false }
-
-# WebSockets library
-ws = { version = "0.11.1", package = "parity-ws" }
-
-# MessagePack library
-rmpv = "1.0.0"
-
-# Concurrent hashmap implementation
-chashmap = "2.2.2"
-
-# A generic serialization/deserialization framework
-serde = { version = "1.0.136", features = ["derive"] }
-serde_json = "1.0.78"
+macros = { path = "./macros" }
 
 # Logging
-log = "0.4.14"
-fern = { version = "0.6.0", features = ["syslog-4"] }
-
-# A safe, extensible ORM and Query builder
-diesel = { version = "1.4.8", features = [ "chrono", "r2d2"] }
-diesel_migrations = "1.4.0"
-
-# Bundled SQLite
-libsqlite3-sys = { version = "0.22.2", features = ["bundled"], optional = true }
-
-# Crypto-related libraries
-rand = "0.8.4"
-ring = "0.16.20"
-
-# UUID generation
-uuid = { version = "0.8.2", features = ["v4"] }
-
-# Date and time libraries
-chrono = { version = "0.4.19", features = ["serde"] }
-chrono-tz = "0.6.1"
-time = "0.2.27"
-
-# Job scheduler
-job_scheduler = "1.2.1"
-
-# TOTP library
-totp-lite = "1.0.3"
-
-# Data encoding library
-data-encoding = "2.3.2"
-
-# JWT library
-jsonwebtoken = "7.2.0"
-
-# U2F library
-u2f = "0.2.0"
-webauthn-rs = "0.3.2"
-
-# Yubico Library
-yubico = { version = "0.10.0", features = ["online-tokio"], default-features = false }
+log = "0.4.22"
+fern = { version = "0.7.1", features = ["syslog-7", "reopen-1"] }
+tracing = { version = "0.1.41", features = ["log"] } # Needed to have lettre and webauthn-rs trace logging to work
 
 # A `dotenv` implementation for Rust
-dotenv = { version = "0.15.0", default-features = false }
+dotenvy = { version = "0.15.7", default-features = false }
 
 # Lazy initialization
-once_cell = "1.9.0"
+once_cell = "1.20.2"
 
 # Numerical libraries
-num-traits = "0.2.14"
-num-derive = "0.3.3"
+num-traits = "0.2.19"
+num-derive = "0.4.2"
+bigdecimal = "0.4.7"
+
+# Web framework
+rocket = { version = "0.5.1", features = ["tls", "json"], default-features = false }
+rocket_ws = { version ="0.1.1" }
+
+# WebSockets libraries
+rmpv = "1.3.0" # MessagePack library
+
+# Concurrent HashMap used for WebSocket messaging and favicons
+dashmap = "6.1.0"
+
+# Async futures
+futures = "0.3.31"
+tokio = { version = "1.42.0", features = ["rt-multi-thread", "fs", "io-util", "parking_lot", "time", "signal", "net"] }
+
+# A generic serialization/deserialization framework
+serde = { version = "1.0.217", features = ["derive"] }
+serde_json = "1.0.135"
+
+# A safe, extensible ORM and Query builder
+diesel = { version = "2.2.6", features = ["chrono", "r2d2", "numeric"] }
+diesel_migrations = "2.2.0"
+diesel_logger = { version = "0.4.0", optional = true }
+
+derive_more = { version = "1.0.0", features = ["from", "into", "as_ref", "deref", "display"] }
+diesel-derive-newtype = "2.1.2"
+
+# Bundled/Static SQLite
+libsqlite3-sys = { version = "0.30.1", features = ["bundled"], optional = true }
+
+# Crypto-related libraries
+rand = { version = "0.8.5", features = ["small_rng"] }
+ring = "0.17.8"
+
+# UUID generation
+uuid = { version = "1.11.0", features = ["v4"] }
+
+# Date and time libraries
+chrono = { version = "0.4.39", features = ["clock", "serde"], default-features = false }
+chrono-tz = "0.10.0"
+time = "0.3.37"
+
+# Job scheduler
+job_scheduler_ng = "2.0.5"
+
+# Data encoding library Hex/Base32/Base64
+data-encoding = "2.6.0"
+
+# JWT library
+jsonwebtoken = "9.3.0"
+
+# TOTP library
+totp-lite = "2.0.1"
+
+# Yubico Library
+yubico = { version = "0.12.0", features = ["online-tokio"], default-features = false }
+
+# WebAuthn libraries
+webauthn-rs = "0.3.2"
+
+# Handling of URL's for WebAuthn and favicons
+url = "2.5.4"
 
 # Email libraries
-tracing = { version = "0.1.29", features = ["log"] } # Needed to have lettre trace logging used when SMTP_DEBUG is enabled.
-lettre = { version = "0.10.0-rc.4", features = ["smtp-transport", "builder", "serde", "native-tls", "hostname", "tracing"], default-features = false }
+lettre = { version = "0.11.11", features = ["smtp-transport", "sendmail-transport", "builder", "serde", "tokio1-native-tls", "hostname", "tracing", "tokio1"], default-features = false }
+percent-encoding = "2.3.1" # URL encoding library used for URL's in the emails
+email_address = "0.2.9"
 
-# Template library
-handlebars = { version = "4.2.1", features = ["dir_source"] }
+# HTML Template library
+handlebars = { version = "6.3.0", features = ["dir_source"] }
 
-# For favicon extraction from main website
-html5ever = "0.25.1"
-markup5ever_rcdom = "0.1.0"
-regex = { version = "1.5.4", features = ["std", "perf", "unicode-perl"], default-features = false }
-data-url = "0.1.1"
+# HTTP client (Used for favicons, version check, DUO and HIBP API)
+reqwest = { version = "0.12.12", features = ["native-tls-alpn", "stream", "json", "gzip", "brotli", "socks", "cookies"] }
+hickory-resolver = "0.24.2"
 
-# Used by U2F, JWT and Postgres
-openssl = "0.10.38"
+# Favicon extraction libraries
+html5gum = "0.7.0"
+regex = { version = "1.11.1", features = ["std", "perf", "unicode-perl"], default-features = false }
+data-url = "0.3.1"
+bytes = "1.9.0"
 
-# URL encoding library
-percent-encoding = "2.1.0"
-# Punycode conversion
-idna = "0.2.3"
+# Cache function results (Used for version check and favicon fetching)
+cached = { version = "0.54.0", features = ["async"] }
+
+# Used for custom short lived cookie jar during favicon extraction
+cookie = "0.18.1"
+cookie_store = "0.21.1"
+
+# Used by U2F, JWT and PostgreSQL
+openssl = "0.10.68"
 
 # CLI argument parsing
-pico-args = "0.4.2"
-
-# Logging panics to logfile instead stderr only
-backtrace = "0.3.64"
+pico-args = "0.5.0"
 
 # Macro ident concatenation
-paste = "1.0.6"
-governor = "0.4.1"
+paste = "1.0.15"
+governor = "0.8.0"
+
+# Check client versions for specific features.
+semver = "1.0.24"
+
+# Allow overriding the default memory allocator
+# Mainly used for the musl builds, since the default musl malloc is very slow
+mimalloc = { version = "0.1.43", features = ["secure"], default-features = false, optional = true }
+which = "7.0.1"
+
+# Argon2 library with support for the PHC format
+argon2 = "0.5.3"
+
+# Reading a password from the cli for generating the Argon2id ADMIN_TOKEN
+rpassword = "7.3.1"
+
+# Loading a dynamic CSS Stylesheet
+grass_compiler = { version = "0.13.4", default-features = false }
 
 [patch.crates-io]
-# Use newest ring
-rocket = { git = 'https://github.com/SergioBenitez/Rocket', rev = '263e39b5b429de1913ce7e3036575a7b4d88b6d7' }
-rocket_contrib = { git = 'https://github.com/SergioBenitez/Rocket', rev = '263e39b5b429de1913ce7e3036575a7b4d88b6d7' }
+# Patch yubico to remove duplicate crates of older versions
+yubico = { git = "https://github.com/BlackDex/yubico-rs", rev = "00df14811f58155c0f02e3ab10f1570ed3e115c6" }
 
-# The maintainer of the `job_scheduler` crate doesn't seem to have responded
-# to any issues or PRs for almost a year (as of April 2021). This hopefully
-# temporary fork updates Cargo.toml to use more up-to-date dependencies.
-# In particular, `cron` has since implemented parsing of some common syntax
-# that wasn't previously supported (https://github.com/zslayton/cron/pull/64).
-job_scheduler = { git = 'https://github.com/jjlin/job_scheduler', rev = 'ee023418dbba2bfe1e30a5fd7d937f9e33739806' }
+# Strip debuginfo from the release builds
+# The symbols are the provide better panic traces
+# Also enable fat LTO and use 1 codegen unit for optimizations
+[profile.release]
+strip = "debuginfo"
+lto = "fat"
+codegen-units = 1
+
+# A little bit of a speedup
+[profile.dev]
+split-debuginfo = "unpacked"
+
+# Always build argon2 using opt-level 3
+# This is a huge speed improvement during testing
+[profile.dev.package.argon2]
+opt-level = 3
+
+# Optimize for size
+[profile.release-micro]
+inherits = "release"
+opt-level = "z"
+strip = "symbols"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+
+# Profile for systems with low resources
+# It will use less resources during build
+[profile.release-low]
+inherits = "release"
+strip = "symbols"
+lto = "thin"
+codegen-units = 16
+
+# Linting config
+# https://doc.rust-lang.org/rustc/lints/groups.html
+[lints.rust]
+# Forbid
+unsafe_code = "forbid"
+non_ascii_idents = "forbid"
+
+# Deny
+deprecated_in_future = "deny"
+future_incompatible = { level = "deny", priority = -1 }
+keyword_idents = { level = "deny", priority = -1 }
+let_underscore = { level = "deny", priority = -1 }
+noop_method_call = "deny"
+refining_impl_trait = { level = "deny", priority = -1 }
+rust_2018_idioms = { level = "deny", priority = -1 }
+rust_2021_compatibility = { level = "deny", priority = -1 }
+rust_2024_compatibility = { level = "deny", priority = -1 }
+edition_2024_expr_fragment_specifier = "allow" # Once changed to Rust 2024 this should be removed and macro's should be validated again
+single_use_lifetimes = "deny"
+trivial_casts = "deny"
+trivial_numeric_casts = "deny"
+unused = { level = "deny", priority = -1 }
+unused_import_braces = "deny"
+unused_lifetimes = "deny"
+unused_qualifications = "deny"
+variant_size_differences = "deny"
+# Allow the following lints since these cause issues with Rust v1.84.0 or newer
+# Building Vaultwarden with Rust v1.85.0 and edition 2024 also works without issues
+if_let_rescope = "allow"
+tail_expr_drop_order = "allow"
+
+# https://rust-lang.github.io/rust-clippy/stable/index.html
+[lints.clippy]
+# Warn
+dbg_macro = "warn"
+todo = "warn"
+
+# Deny
+case_sensitive_file_extension_comparisons = "deny"
+cast_lossless = "deny"
+clone_on_ref_ptr = "deny"
+equatable_if_let = "deny"
+filter_map_next = "deny"
+float_cmp_const = "deny"
+inefficient_to_string = "deny"
+iter_on_empty_collections = "deny"
+iter_on_single_items = "deny"
+linkedlist = "deny"
+macro_use_imports = "deny"
+manual_assert = "deny"
+manual_instant_elapsed = "deny"
+manual_string_new = "deny"
+match_on_vec_items = "deny"
+match_wildcard_for_single_variants = "deny"
+mem_forget = "deny"
+needless_continue = "deny"
+needless_lifetimes = "deny"
+option_option = "deny"
+string_add_assign = "deny"
+string_to_string = "deny"
+unnecessary_join = "deny"
+unnecessary_self_imports = "deny"
+unnested_or_patterns = "deny"
+unused_async = "deny"
+unused_self = "deny"
+verbose_file_reads = "deny"
+zero_sized_map_values = "deny"

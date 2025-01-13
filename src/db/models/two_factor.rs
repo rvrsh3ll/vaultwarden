@@ -1,21 +1,19 @@
 use serde_json::Value;
 
+use super::UserId;
 use crate::{api::EmptyResult, db::DbConn, error::MapResult};
 
-use super::User;
-
 db_object! {
-    #[derive(Identifiable, Queryable, Insertable, Associations, AsChangeset)]
-    #[table_name = "twofactor"]
-    #[belongs_to(User, foreign_key = "user_uuid")]
-    #[primary_key(uuid)]
+    #[derive(Identifiable, Queryable, Insertable, AsChangeset)]
+    #[diesel(table_name = twofactor)]
+    #[diesel(primary_key(uuid))]
     pub struct TwoFactor {
-        pub uuid: String,
-        pub user_uuid: String,
+        pub uuid: TwoFactorId,
+        pub user_uuid: UserId,
         pub atype: i32,
         pub enabled: bool,
         pub data: String,
-        pub last_used: i32,
+        pub last_used: i64,
     }
 }
 
@@ -37,13 +35,16 @@ pub enum TwoFactorType {
     EmailVerificationChallenge = 1002,
     WebauthnRegisterChallenge = 1003,
     WebauthnLoginChallenge = 1004,
+
+    // Special type for Protected Actions verification via email
+    ProtectedActions = 2000,
 }
 
 /// Local methods
 impl TwoFactor {
-    pub fn new(user_uuid: String, atype: TwoFactorType, data: String) -> Self {
+    pub fn new(user_uuid: UserId, atype: TwoFactorType, data: String) -> Self {
         Self {
-            uuid: crate::util::get_uuid(),
+            uuid: TwoFactorId(crate::util::get_uuid()),
             user_uuid,
             atype: atype as i32,
             enabled: true,
@@ -54,24 +55,24 @@ impl TwoFactor {
 
     pub fn to_json(&self) -> Value {
         json!({
-            "Enabled": self.enabled,
-            "Key": "", // This key and value vary
-            "Object": "twoFactorAuthenticator" // This value varies
+            "enabled": self.enabled,
+            "key": "", // This key and value vary
+            "Oobject": "twoFactorAuthenticator" // This value varies
         })
     }
 
     pub fn to_json_provider(&self) -> Value {
         json!({
-            "Enabled": self.enabled,
-            "Type": self.atype,
-            "Object": "twoFactorProvider"
+            "enabled": self.enabled,
+            "type": self.atype,
+            "object": "twoFactorProvider"
         })
     }
 }
 
 /// Database methods
 impl TwoFactor {
-    pub fn save(&self, conn: &DbConn) -> EmptyResult {
+    pub async fn save(&self, conn: &mut DbConn) -> EmptyResult {
         db_run! { conn:
             sqlite, mysql {
                 match diesel::replace_into(twofactor::table)
@@ -95,7 +96,7 @@ impl TwoFactor {
                 // We need to make sure we're not going to violate the unique constraint on user_uuid and atype.
                 // This happens automatically on other DBMS backends due to replace_into(). PostgreSQL does
                 // not support multiple constraints on ON CONFLICT clauses.
-                diesel::delete(twofactor::table.filter(twofactor::user_uuid.eq(&self.user_uuid)).filter(twofactor::atype.eq(&self.atype)))
+                let _: () = diesel::delete(twofactor::table.filter(twofactor::user_uuid.eq(&self.user_uuid)).filter(twofactor::atype.eq(&self.atype)))
                     .execute(conn)
                     .map_res("Error deleting twofactor for insert")?;
 
@@ -110,7 +111,7 @@ impl TwoFactor {
         }
     }
 
-    pub fn delete(self, conn: &DbConn) -> EmptyResult {
+    pub async fn delete(self, conn: &mut DbConn) -> EmptyResult {
         db_run! { conn: {
             diesel::delete(twofactor::table.filter(twofactor::uuid.eq(self.uuid)))
                 .execute(conn)
@@ -118,7 +119,7 @@ impl TwoFactor {
         }}
     }
 
-    pub fn find_by_user(user_uuid: &str, conn: &DbConn) -> Vec<Self> {
+    pub async fn find_by_user(user_uuid: &UserId, conn: &mut DbConn) -> Vec<Self> {
         db_run! { conn: {
             twofactor::table
                 .filter(twofactor::user_uuid.eq(user_uuid))
@@ -129,7 +130,7 @@ impl TwoFactor {
         }}
     }
 
-    pub fn find_by_user_and_type(user_uuid: &str, atype: i32, conn: &DbConn) -> Option<Self> {
+    pub async fn find_by_user_and_type(user_uuid: &UserId, atype: i32, conn: &mut DbConn) -> Option<Self> {
         db_run! { conn: {
             twofactor::table
                 .filter(twofactor::user_uuid.eq(user_uuid))
@@ -140,7 +141,7 @@ impl TwoFactor {
         }}
     }
 
-    pub fn delete_all_by_user(user_uuid: &str, conn: &DbConn) -> EmptyResult {
+    pub async fn delete_all_by_user(user_uuid: &UserId, conn: &mut DbConn) -> EmptyResult {
         db_run! { conn: {
             diesel::delete(twofactor::table.filter(twofactor::user_uuid.eq(user_uuid)))
                 .execute(conn)
@@ -148,7 +149,7 @@ impl TwoFactor {
         }}
     }
 
-    pub fn migrate_u2f_to_webauthn(conn: &DbConn) -> EmptyResult {
+    pub async fn migrate_u2f_to_webauthn(conn: &mut DbConn) -> EmptyResult {
         let u2f_factors = db_run! { conn: {
             twofactor::table
                 .filter(twofactor::atype.eq(TwoFactorType::U2f as i32))
@@ -157,7 +158,7 @@ impl TwoFactor {
                 .from_db()
         }};
 
-        use crate::api::core::two_factor::u2f::U2FRegistration;
+        use crate::api::core::two_factor::webauthn::U2FRegistration;
         use crate::api::core::two_factor::webauthn::{get_webauthn_registrations, WebauthnRegistration};
         use webauthn_rs::proto::*;
 
@@ -168,7 +169,7 @@ impl TwoFactor {
                 continue;
             }
 
-            let (_, mut webauthn_regs) = get_webauthn_registrations(&u2f.user_uuid, conn)?;
+            let (_, mut webauthn_regs) = get_webauthn_registrations(&u2f.user_uuid, conn).await?;
 
             // If the user already has webauthn registrations saved, don't overwrite them
             if !webauthn_regs.is_empty() {
@@ -207,12 +208,16 @@ impl TwoFactor {
             }
 
             u2f.data = serde_json::to_string(&regs)?;
-            u2f.save(conn)?;
+            u2f.save(conn).await?;
 
             TwoFactor::new(u2f.user_uuid.clone(), TwoFactorType::Webauthn, serde_json::to_string(&webauthn_regs)?)
-                .save(conn)?;
+                .save(conn)
+                .await?;
         }
 
         Ok(())
     }
 }
+
+#[derive(Clone, Debug, DieselNewType, FromForm, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct TwoFactorId(String);
